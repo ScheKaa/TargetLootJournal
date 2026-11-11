@@ -2,7 +2,7 @@
 ## Title: Target Loot (Journal)
 ## Notes: A small button on your target showing what that creature drops, straight from your realm's loot tables through the mod-forever-journal server module. Drops from the creature itself are listed apart from shared world drops. Click the button (or /tloot) to open the loot list; hover an item for its tooltip, Shift-click to link it, Ctrl-click to preview it.
 ## Author: Ported for this realm
-## License: Public Domain (The Unlicense) - see LICENSE
+## License: MIT - see LICENSE
 ## Version: 1.0.0
 ## OptionalDeps: Journal, DragonUI
 ## SavedVariables: TargetLootJournalDB

@@ -3,6 +3,7 @@
 !.gitignore
 !.gitattributes
 !LICENSE*
+!README*
 
 # ... except the addon we actually track.
 !TargetLootJournal/
