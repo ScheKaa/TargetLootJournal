@@ -130,6 +130,9 @@ end
 methods.SetHyperlink = function (self, link) self.__link = link end
 methods.GetFrameLevel = function (self) return rawget(self, "__level") or 1 end
 methods.SetFrameLevel = function (self, level) rawset(self, "__level", level) end
+methods.RegisterForDrag = function (self, button) self.__drag = button end
+methods.SetMinResize = function (self, w, h) self.__minWidth, self.__minHeight = w, h end
+methods.GetStringWidth = function (self) return 6 * #(self.__text or "") end
 methods.StartMoving = function () end
 methods.StopMovingOrSizing = function () end
 methods.SetScrollChild = function (self, child) self.__child = child end
@@ -149,6 +152,8 @@ for _, name in ipairs({
 	"SetTexCoord", "SetVertexColor", "SetBlendMode", "SetDesaturated", "SetTextColor",
 	"SetJustifyH", "SetWordWrap", "SetBackdropColor", "SetBackdropBorderColor", "RegisterForClicks",
 	"EnableMouse", "SetFrameStrata", "SetToplevel", "SetClampedToScreen", "SetMovable", "SetScrollChild",
+	"SetResizable", "SetMaxResize", "StartSizing", "SetNormalTexture", "SetPushedTexture",
+	"SetHighlightTexture",
 }) do
 	methods[name] = methods[name] or function () end
 end
@@ -288,6 +293,14 @@ check("window was created", panel ~= nil)
 
 TL.Toggle()
 check("window opens", panel:IsShown())
+
+print("dragging")
+check("the header is the drag handle", panel.header ~= nil and panel.header.__drag == "LeftButton",
+	panel.header and tostring(panel.header.__drag))
+panel.header:GetScript("OnDragStart")()
+panel.header:GetScript("OnDragStop")()
+check("dropping the window remembers where it is", TL.DB.point ~= nil and TL.DB.point.x == 640
+	and TL.DB.point.y == 360, TL.DB.point and (TL.DB.point.x .. "," .. TL.DB.point.y))
 
 local function visibleRows()
 	local count = 0
@@ -433,6 +446,24 @@ eq("quest row hidden", visibleRows(), 30)
 panel.toggles[2]:GetScript("OnClick")()
 eq("quest row comes back", visibleRows(), 31)
 check("the quest row is really there", rowFor(117) ~= nil)
+
+-----------------------------------------
+-- resizing
+
+print("resizing")
+local longName = string.rep("Very Long Creature Name ", 4)     -- 92 characters
+local wanted = 6 * #longName + 52
+targetGUID, targetName = "0xF1300007C0000001", longName
+fire("PLAYER_TARGET_CHANGED")
+TL.Show()
+check("a long name widens the window", panel:GetWidth() == wanted,
+	panel:GetWidth() .. " vs " .. wanted)
+check("and its minimum is the name's width", panel.__minWidth == wanted, tostring(panel.__minWidth))
+check("a resize grip is there", panel.grip ~= nil and panel.grip:GetScript("OnMouseDown") ~= nil)
+panel.grip:GetScript("OnMouseDown")()
+panel.grip:GetScript("OnMouseUp")()
+check("a resize is remembered", TL.DB.width == wanted and TL.DB.height == panel:GetHeight(),
+	TL.DB.width and (TL.DB.width .. "x" .. TL.DB.height))
 
 -----------------------------------------
 -- API usage

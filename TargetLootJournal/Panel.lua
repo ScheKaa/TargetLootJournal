@@ -2,14 +2,17 @@
 -- UI skin (DragonUI) carries its fonts and colours into it.
 
 local _, TL = ...
-local floor, max = math.floor, math.max
+local floor, max, min = math.floor, math.max, math.min
 local LOOT = TL.LOOT
 local DB = TL.DB
 
 local PANEL_WIDTH, PANEL_HEIGHT = 346, 404
 local ROW_HEIGHT = 34
 local HEADER_HEIGHT = 22
-local CONTENT_WIDTH = PANEL_WIDTH - 44
+-- The window resizes from its bottom-right corner, but never narrower than the creature's name
+-- (FitToContent below) and never wider or taller than this.
+local MIN_WIDTH, MIN_HEIGHT = 260, 180
+local MAX_WIDTH, MAX_HEIGHT = 640, 620
 local WHITE = "Interface\\Buttons\\WHITE8X8"
 local FALLBACK_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
 local BAG_ICON = "Interface\\Icons\\INV_Misc_Bag_08"
@@ -19,6 +22,11 @@ local DIM = { 0.55, 0.55, 0.55 }
 local button, panel
 local currentEntry
 local rowPool, headerPool = {}, {}
+
+-- The list is the panel less its side padding, so a resize only has to re-point it.
+local function ContentWidth()
+	return max(60, (panel and panel:GetWidth() or PANEL_WIDTH) - 44)
+end
 
 -----------------------------------------
 -- helpers
@@ -302,7 +310,7 @@ local function RenderRows()
 		fs:SetTextColor(GOLD[1], GOLD[2], GOLD[3])
 		fs:ClearAllPoints()
 		fs:SetPoint("TOPLEFT", panel.content, "TOPLEFT", 2, -y)
-		fs:SetWidth(CONTENT_WIDTH)
+		fs:SetPoint("TOPRIGHT", panel.content, "TOPRIGHT", -2, -y)
 		fs:Show()
 		y = y + HEADER_HEIGHT
 	end
@@ -316,7 +324,7 @@ local function RenderRows()
 		end
 		r:ClearAllPoints()
 		r:SetPoint("TOPLEFT", panel.content, "TOPLEFT", 0, -y)
-		r:SetWidth(CONTENT_WIDTH)
+		r:SetPoint("TOPRIGHT", panel.content, "TOPRIGHT", 0, -y)
 		SetupRow(r, data)
 		r:Show()
 		y = y + ROW_HEIGHT
@@ -362,11 +370,22 @@ local function RenderRows()
 	panel.content:SetHeight(max(y, 1))
 end
 
+-- The window is never narrower than the creature's name: the title and the line under it are one
+-- line each, so a narrower window would clip the name the window is about.
+local function FitToContent()
+	if not panel then return end
+	local widest = max(panel.title:GetStringWidth() or 0, panel.subtitle:GetStringWidth() or 0)
+	local wanted = min(MAX_WIDTH, max(MIN_WIDTH, widest + 52))
+	panel:SetMinResize(wanted, MIN_HEIGHT)
+	if panel:GetWidth() < wanted then panel:SetWidth(wanted) end
+end
+
 function Render()
 	-- The title follows the target, not the moment the window opened.
 	panel.title:SetText(UnitName("target") or "Target loot")
 	RenderRows()
 	UpdateToggles()
+	FitToContent()
 end
 
 local function ToggleButton(parent, label, x, key, tip)
@@ -397,11 +416,14 @@ end
 
 local function CreatePanel()
 	panel = CreateFrame("Frame", "TargetLootJournalFrame", UIParent)
-	panel:SetSize(PANEL_WIDTH, PANEL_HEIGHT)
+	panel:SetSize(DB.width and max(DB.width, MIN_WIDTH) or PANEL_WIDTH,
+		DB.height and max(DB.height, MIN_HEIGHT) or PANEL_HEIGHT)
 	panel:SetFrameStrata("DIALOG")
 	panel:SetToplevel(true)
 	panel:SetClampedToScreen(true)
 	panel:SetMovable(true)
+	panel:SetResizable(true)
+	panel:SetMaxResize(MAX_WIDTH, MAX_HEIGHT)
 	panel:EnableMouse(true)
 	Skin(panel, 0.96)
 	panel:Hide()
@@ -418,8 +440,26 @@ local function CreatePanel()
 	panel.subtitle:SetJustifyH("LEFT")
 	panel.subtitle:SetTextColor(DIM[1], DIM[2], DIM[3])
 
+	-- The header (the creature's name and the line under it) is the drag handle, so it has to be a
+	-- frame of its own: a font string takes no mouse, and the panel is covered by the scroll frame.
+	panel.header = CreateFrame("Frame", nil, panel)
+	panel.header:SetPoint("TOPLEFT")
+	panel.header:SetPoint("TOPRIGHT")
+	panel.header:SetHeight(44)
+	panel.header:EnableMouse(true)
+	panel.header:RegisterForDrag("LeftButton")
+	panel.header:SetScript("OnDragStart", function () panel:StartMoving() end)
+	panel.header:SetScript("OnDragStop", function ()
+		panel:StopMovingOrSizing()
+		local x, y = panel:GetCenter()
+		if x and y then
+			DB.point = { x = floor(x + 0.5), y = floor(y + 0.5) }
+		end
+	end)
+
 	local close = CreateFrame("Button", nil, panel, "UIPanelCloseButton")
 	close:SetPoint("TOPRIGHT", 0, 0)
+	close:SetFrameLevel(panel.header:GetFrameLevel() + 1)
 
 	panel.toggles = {
 		ToggleButton(panel, "World", 14, "showShared", "List the shared world drop tables this creature can also roll."),
@@ -437,7 +477,7 @@ local function CreatePanel()
 	panel.scroll:SetPoint("BOTTOMRIGHT", -28, 30)
 
 	panel.content = CreateFrame("Frame", nil, panel.scroll)
-	panel.content:SetWidth(CONTENT_WIDTH)
+	panel.content:SetWidth(ContentWidth())
 	panel.content:SetHeight(1)
 	panel.scroll:SetScrollChild(panel.content)
 	panel.scroll:EnableMouseWheel(true)
@@ -446,9 +486,17 @@ local function CreatePanel()
 		self:SetVerticalScroll(max(0, math.min((self:GetVerticalScroll() or 0) - delta * ROW_HEIGHT * 2, limit)))
 	end)
 
+	-- A resize re-points the list; the rows and the section headers are anchored to it, so they follow.
+	panel:SetScript("OnSizeChanged", function (self)
+		self.content:SetWidth(ContentWidth())
+		-- The scroll offset can now be past the end of a taller window.
+		local limit = max(0, self.content:GetHeight() - self.scroll:GetHeight())
+		if (self.scroll:GetVerticalScroll() or 0) > limit then self.scroll:SetVerticalScroll(limit) end
+	end)
+
 	panel.empty = panel:CreateFontString(nil, "OVERLAY", "GameFontDisable")
-	panel.empty:SetPoint("TOP", panel.scroll, "TOP", 0, -16)
-	panel.empty:SetWidth(CONTENT_WIDTH)
+	panel.empty:SetPoint("TOPLEFT", panel.scroll, "TOPLEFT", 8, -16)
+	panel.empty:SetPoint("TOPRIGHT", panel.scroll, "TOPRIGHT", -8, -16)
 	panel.empty:SetJustifyH("CENTER")
 	panel.empty:Hide()
 
@@ -456,13 +504,18 @@ local function CreatePanel()
 	panel.footer:SetPoint("BOTTOMLEFT", 14, 10)
 	panel.footer:SetText("Shift-click link  -  Ctrl-click preview  -  drag the header to move")
 
-	panel:SetScript("OnDragStart", function (self) self:StartMoving() end)
-	panel:SetScript("OnDragStop", function (self)
-		self:StopMovingOrSizing()
-		local x, y = self:GetCenter()
-		if x and y then
-			DB.point = { x = floor(x + 0.5), y = floor(y + 0.5) }
-		end
+	-- The bottom-right corner resizes it, with the same grip the chat frame uses.
+	panel.grip = CreateFrame("Button", nil, panel)
+	panel.grip:SetSize(16, 16)
+	panel.grip:SetPoint("BOTTOMRIGHT", -3, 3)
+	panel.grip:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+	panel.grip:SetPushedTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Down")
+	panel.grip:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight")
+	panel.grip:SetScript("OnMouseDown", function () panel:StartSizing("BOTTOMRIGHT") end)
+	panel.grip:SetScript("OnMouseUp", function ()
+		panel:StopMovingOrSizing()
+		DB.width = floor(panel:GetWidth() + 0.5)
+		DB.height = floor(panel:GetHeight() + 0.5)
 	end)
 
 	if DB.point then
@@ -496,10 +549,12 @@ function TL.Toggle()
 end
 
 function TL.ResetPosition()
-	DB.point = nil
+	DB.point, DB.width, DB.height = nil, nil, nil
 	if panel then
 		panel:ClearAllPoints()
 		panel:SetPoint("TOPRIGHT", UIParent, "TOPRIGHT", -280, -180)
+		panel:SetSize(PANEL_WIDTH, PANEL_HEIGHT)
+		FitToContent()
 	end
 end
 
