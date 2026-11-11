@@ -1,0 +1,8 @@
+# Ignore every top-level entry in this addons folder ...
+/*
+!.gitignore
+!.gitattributes
+!LICENSE*
+
+# ... except the addon we actually track.
+!TargetLootJournal/

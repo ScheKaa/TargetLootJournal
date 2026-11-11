@@ -1,0 +1,306 @@
+diff --git a/addon/Journal/Overview.lua b/addon/Journal/Overview.lua
+index 6578df2..2c1161a 100644
+--- a/addon/Journal/Overview.lua
++++ b/addon/Journal/Overview.lua
+@@ -94,8 +94,10 @@ end
+ 
+ -- It sits above the scroll area, not in it: the 3.3.5 client draws a model inside a scroll
+ -- frame in the wrong place, on top of the boss list and the text.
++-- A DressUpModel, not a PlayerModel: the 3.3.5 client only skins a character-model creature (a
++-- humanoid boss built from a race model) in a DressUpModel; a PlayerModel draws it white.
+ local MODEL_HEIGHT = 250
+-local model = CreateFrame("PlayerModel", nil, pane)
++local model = CreateFrame("DressUpModel", nil, pane)
+ model:SetPoint("TOPLEFT", pane, "TOPLEFT", 4, -4)
+ model:SetPoint("TOPRIGHT", pane, "TOPRIGHT", -26, -4)
+ model:SetHeight(MODEL_HEIGHT)
+diff --git a/src/Journal.cpp b/src/Journal.cpp
+index 6d2a70b..3b7971d 100644
+--- a/src/Journal.cpp
++++ b/src/Journal.cpp
+@@ -360,7 +360,8 @@ namespace Journal
+             // Every heading, and the longest headings' quests.
+             if (command == "G" || command == "Z")
+                 return 4.0f;
+-            if (command == "L" || command == "Q" || command == "F" || command == "K" || command == "X" || command == "N" || command == "Y" || command == "P")
++            if (command == "L" || command == "Q" || command == "F" || command == "K" || command == "X" || command == "N" || command == "Y" || command == "P"
++                || command == "TL")
+                 return 2.0f;
+             return 1.0f;
+         }
+@@ -505,6 +506,8 @@ namespace Journal
+                 Index::HandleLoot(player, req, args);
+             else if (command == "K")
+                 Loot::HandleTokens(player, req, args);
++            else if (command == "TL")
++                Loot::HandleCreatureLoot(player, req, args);
+             else if (command == "Q")
+                 Index::HandleQuests(player, req, args);
+             else if (command == "QD")
+diff --git a/src/Journal.h b/src/Journal.h
+index cbe347c..94993f7 100644
+--- a/src/Journal.h
++++ b/src/Journal.h
+@@ -300,6 +300,10 @@ namespace Journal
+ 
+         // K:<req>:<item> -> KR, KD rows, KE: what a token turns into.
+         void HandleTokens(Player* player, std::string const& req, std::vector<std::string_view> const& args);
++
++        // TL:<req>:<creature> -> TLR, TLD rows, TLE: what one kill of that creature drops, world
++        // drop tables included and flagged LOOT_SHARED rather than left out.
++        void HandleCreatureLoot(Player* player, std::string const& req, std::vector<std::string_view> const& args);
+     }
+ 
+     // ---- JournalAbilities.cpp: what a creature casts --------------------------------------------
+diff --git a/src/JournalLoot.cpp b/src/JournalLoot.cpp
+index 1cbdaf2..165db42 100644
+--- a/src/JournalLoot.cpp
++++ b/src/JournalLoot.cpp
+@@ -25,6 +25,7 @@
+  */
+ 
+ #include "Journal.h"
++#include "CreatureData.h"
+ #include "DBCStores.h"
+ #include "DatabaseEnv.h"
+ #include "QueryResult.h"
+@@ -39,6 +40,7 @@
+ #include <array>
+ #include <cmath>
+ #include <functional>
++#include <mutex>
+ #include <unordered_map>
+ #include <unordered_set>
+ 
+@@ -72,6 +74,10 @@ namespace Journal::Loot
+         std::array<std::unordered_map<uint32, std::vector<Drop>>, STORE_COUNT> sDrops;
+         std::vector<Drop> const sNone;
+ 
++        // Loot ids asked for at run time by the target window: world drop tables included, which
++        // the journal's own lists leave out.
++        std::unordered_map<uint32, std::vector<Drop>> sTargetLoot;
++
+         constexpr std::size_t MAX_TOKEN_RESULTS = 40;
+ 
+         struct TokenResult
+@@ -208,7 +214,7 @@ namespace Journal::Loot
+                 "item_loot_template", "skinning_loot_template", "pickpocketing_loot_template" })
+             {
+                 if (QueryResult result = WorldDatabase.Query("SELECT CAST(ABS(Reference) AS UNSIGNED), COUNT(DISTINCT Entry) "
+-                    "FROM {} WHERE Reference <> 0 GROUP BY ABS(Reference)", table))
++                    "FROM {} WHERE Reference <> 0 GROUP BY CAST(ABS(Reference) AS UNSIGNED)", table))
+                     do
+                     {
+                         Field* f = result->Fetch();
+@@ -276,7 +282,8 @@ namespace Journal::Loot
+             o.flags = (o.flags & flags & EVERY_PATH) | ((o.flags | flags) & ~EVERY_PATH);
+         }
+ 
+-        OddsMap Compute(Table const& table, uint32 condSource, uint32 lootId, uint32 depth, bool hardMode);
++        OddsMap Compute(Table const& table, uint32 condSource, uint32 lootId, uint32 depth, bool hardMode,
++            bool includeWorldDrops);
+ 
+         // A table that is one group of zero-chance entries (most raid boss tables): repeated runs
+         // never pick the same equippable item twice (LootGroupInvalidSelector), so n runs over k
+@@ -292,17 +299,19 @@ namespace Journal::Loot
+             return true;
+         }
+ 
+-        void AddReference(OddsMap& into, Row const& row, float p, uint32 depth, uint32 extraFlags, bool hardMode)
++        void AddReference(OddsMap& into, Row const& row, float p, uint32 depth, uint32 extraFlags, bool hardMode,
++            bool includeWorldDrops)
+         {
+             if (depth >= MAX_DEPTH || p <= 0.0f)
+                 return;
+             bool world = IsWorldDrop(row.reference);
+-            if (world && !GetConfig().showWorldDrops)
++            if (world && !includeWorldDrops)
+                 return;
+             auto itr = sReference.find(row.reference);
+             if (itr == sReference.end())
+                 return;
+-            OddsMap sub = Compute(itr->second, COND_REFERENCE_LOOT, row.reference, depth + 1, hardMode);
++            OddsMap sub = Compute(itr->second, COND_REFERENCE_LOOT, row.reference, depth + 1, hardMode,
++                includeWorldDrops);
+             // The core runs the reference uint32(MaxCount * rate) times, which can be none.
+             float n = std::floor(float(row.maxCount) * sWorld->getRate(RATE_DROP_ITEM_REFERENCED_AMOUNT));
+             if (n < 1.0f)
+@@ -335,7 +344,8 @@ namespace Journal::Loot
+             return hardMode || (row.lootMode & LOOT_MODE_DEFAULT_BIT);
+         }
+ 
+-        OddsMap Compute(Table const& table, uint32 condSource, uint32 lootId, uint32 depth, bool hardMode)
++        OddsMap Compute(Table const& table, uint32 condSource, uint32 lootId, uint32 depth, bool hardMode,
++            bool includeWorldDrops)
+         {
+             OddsMap out;
+             float const refRate = sWorld->getRate(RATE_DROP_ITEM_REFERENCED);
+@@ -349,7 +359,7 @@ namespace Journal::Loot
+                 if (row.reference)
+                 {
+                     float p = row.chance >= 100.0f ? 1.0f : row.chance * refRate / 100.0f;
+-                    AddReference(out, row, p, depth, flags & LOOT_HARD_MODE, hardMode);
++                    AddReference(out, row, p, depth, flags & LOOT_HARD_MODE, hardMode, includeWorldDrops);
+                 }
+                 else
+                 {
+@@ -391,7 +401,7 @@ namespace Journal::Loot
+                 {
+                     uint32 flags = RowFlags(*row, condSource, lootId);
+                     if (row->reference)
+-                        AddReference(out, *row, p, depth, flags & LOOT_HARD_MODE, hardMode);
++                        AddReference(out, *row, p, depth, flags & LOOT_HARD_MODE, hardMode, includeWorldDrops);
+                     else
+                         Add(out, row->item, p, flags, row->minCount, row->maxCount);
+                 }
+@@ -400,9 +410,9 @@ namespace Journal::Loot
+         }
+ 
+         // Normal mode's odds, plus what only hard mode drops (flagged).
+-        OddsMap ComputeBothModes(Table const& table, uint32 condSource, uint32 lootId)
++        OddsMap ComputeBothModes(Table const& table, uint32 condSource, uint32 lootId, bool includeWorldDrops)
+         {
+-            OddsMap normal = Compute(table, condSource, lootId, 0, false);
++            OddsMap normal = Compute(table, condSource, lootId, 0, false, includeWorldDrops);
+             bool anyHard = false;
+             std::function<bool(Table const&, uint32)> hasHard = [&](Table const& t, uint32 depth) -> bool
+             {
+@@ -424,7 +434,7 @@ namespace Journal::Loot
+                 return normal;
+             for (auto& [item, odds] : normal)
+                 odds.flags &= ~uint32(LOOT_HARD_MODE);
+-            OddsMap hard = Compute(table, condSource, lootId, 0, true);
++            OddsMap hard = Compute(table, condSource, lootId, 0, true, includeWorldDrops);
+             for (auto const& [item, odds] : hard)
+                 if (!normal.count(item))
+                 {
+@@ -473,6 +483,7 @@ namespace Journal::Loot
+         sConditioned.clear();
+         for (auto& drops : sDrops)
+             drops.clear();
++        sTargetLoot.clear();
+ 
+         ReadReferenceUsers();
+         ReadConditions();
+@@ -502,7 +513,8 @@ namespace Journal::Loot
+         {
+             uint32 extra = store == std::size_t(Store::GameObject) ? uint32(LOOT_CHEST) : 0u;
+             for (auto const& [id, table] : sTables[store])
+-                sDrops[store][id] = ToDrops(ComputeBothModes(table, STORE_CONDITIONS[store], id), extra);
++                sDrops[store][id] = ToDrops(ComputeBothModes(table, STORE_CONDITIONS[store], id,
++                    GetConfig().showWorldDrops), extra);
+         }
+ 
+         LOG_INFO("server.loading", ">> mod-forever-journal: {} creature, {} chest, {} container, {} fishing and {} pickpocket "
+@@ -517,6 +529,51 @@ namespace Journal::Loot
+         return itr != map.end() ? itr->second : sNone;
+     }
+ 
++    namespace
++    {
++        // Reads the given reference tables and everything they reach, world drop tables included:
++        // the target window lists those apart from the creature's own drops instead of hiding them.
++        void ReadReferenceTree(std::vector<uint32> pending)
++        {
++            for (uint32 depth = 0; depth < MAX_DEPTH && !pending.empty(); ++depth)
++            {
++                std::vector<uint32> wanted;
++                for (uint32 ref : pending)
++                    if (!sReference.count(ref))
++                        wanted.push_back(ref);
++                std::sort(wanted.begin(), wanted.end());
++                wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
++                if (wanted.empty())
++                    return;
++                for (uint32 ref : wanted)
++                    sReference[ref]; // known, even when empty
++                pending = ReadTable("reference_loot_template", wanted, sReference);
++            }
++        }
++    }
++
++    // One kill of a creature's loot id, the way the journal computes a boss table, but with the
++    // world drop references kept and flagged LOOT_SHARED. Read on request: a targeted creature's
++    // loot id need not be one the journal loaded at startup. The lock is for two players asking
++    // from different map threads at once.
++    std::vector<Drop> CreatureLoot(uint32 lootId)
++    {
++        static std::mutex lock;
++        std::lock_guard<std::mutex> guard(lock);
++
++        auto cached = sTargetLoot.find(lootId);
++        if (cached != sTargetLoot.end())
++            return cached->second;
++
++        auto& tables = sTables[std::size_t(Store::Creature)];
++        if (!tables.count(lootId))
++            ReadReferenceTree(ReadTable(STORE_TABLES[0], { lootId }, tables));
++
++        OddsMap odds = ComputeBothModes(tables[lootId], STORE_CONDITIONS[0], lootId, true);
++        sTargetLoot[lootId] = ToDrops(odds, 0);
++        return sTargetLoot[lootId];
++    }
++
+     bool IsWorldDropTable(uint32 reference)
+     {
+         return IsWorldDrop(reference);
+@@ -629,6 +686,46 @@ namespace Journal::Loot
+         Send(player, "KE:" + req);
+     }
+ 
++    // TL:<req>:<creature entry> -> TLR, TLD rows, TLE: what one kill of that creature drops, its
++    // world drop tables included and flagged LOOT_SHARED so a client can list them apart. Sent to
++    // addons other than the Journal one: the codes are three letters, which its parser ignores.
++    void HandleCreatureLoot(Player* player, std::string const& req, std::vector<std::string_view> const& args)
++    {
++        uint32 entry = 0;
++        if (args.size() < 3 || !ParseUInt(args[2], entry))
++        {
++            SendError(player, req, "bad");
++            return;
++        }
++
++        CreatureTemplate const* proto = sObjectMgr->GetCreatureTemplate(entry);
++        if (!proto)
++        {
++            SendError(player, req, "bad");
++            return;
++        }
++
++        // An empty lootid falls back to the creature's own entry, as the core's loot lookup does.
++        uint32 lootId = proto->lootid ? proto->lootid : entry;
++        std::vector<Drop> drops = CreatureLoot(lootId);
++
++        std::vector<std::string> rows;
++        rows.reserve(drops.size());
++        for (Drop const& drop : drops)
++        {
++            ItemTemplate const* item = sObjectMgr->GetItemTemplate(drop.item);
++            if (!item)
++                continue;
++            rows.push_back(Acore::StringFormat("{},{},{},{},{},{},{},{},{},{},{},{},{},{}", drop.item,
++                uint32(std::lround(drop.chance * 100.0f)), drop.flags, drop.minCount, drop.maxCount,
++                item->Quality, item->Class, item->SubClass, item->InventoryType, item->ItemLevel,
++                item->RequiredLevel, Escape(item->Name1, 60), ClassesOf(drop.item, false), lootId));
++        }
++        Send(player, Acore::StringFormat("TLR:{}:{}:{}:{}", req, entry, lootId, rows.size()));
++        SendRows(player, "TLD:" + req, rows);
++        Send(player, "TLE:" + req);
++    }
++
+     uint32 Hash(uint32 seed)
+     {
+         // Order-independent: XOR of each drop's own FNV hash.
+diff --git a/tools/addon_smoke_test.lua b/tools/addon_smoke_test.lua
+index 9449743..dc52f00 100644
+--- a/tools/addon_smoke_test.lua
++++ b/tools/addon_smoke_test.lua
+@@ -703,7 +703,7 @@ step("boss: overview, abilities", function ()
+ 	assert(textShown("3,500 health"), "boss health missing")
+ 	assert(textShown("Defeated this lockout"), "kill not shown")
+ 	-- The 3.3.5 client draws a model inside a scroll frame in the wrong place.
+-	local model = find(function (f) return f.__kind == "PlayerModel" and f:IsVisible() end)
++	local model = find(function (f) return f.__kind == "DressUpModel" and f:IsVisible() end)
+ 	assert(model, "boss model not shown")
+ 	local p = model:GetParent()
+ 	while p do
